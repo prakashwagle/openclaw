@@ -115,6 +115,26 @@ LABEL org.opencontainers.image.source="https://github.com/openclaw/openclaw" \
   org.opencontainers.image.title="OpenClaw" \
   org.opencontainers.image.description="OpenClaw gateway and CLI runtime container image"
 
+# Install Bun (required for build scripts)
+RUN curl -fsSL https://bun.sh/install | bash
+ENV PATH="/root/.bun/bin:${PATH}"
+
+# Install Yarn
+RUN corepack enable && corepack prepare yarn@stable --activate
+
+# Install Homebrew dependencies
+RUN apt-get update && \
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+    build-essential procps curl file git sudo && \
+    apt-get clean && rm -rf /var/lib/apt/lists/*
+
+# Install Homebrew as node user (brew refuses to run as root)
+RUN echo "node ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers
+USER node
+RUN NONINTERACTIVE=1 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+ENV PATH="/home/linuxbrew/.linuxbrew/bin:/home/linuxbrew/.linuxbrew/sbin:${PATH}"
+USER root
+
 WORKDIR /app
 
 # Install system utilities present in bookworm but missing in bookworm-slim.
@@ -199,12 +219,33 @@ RUN --mount=type=cache,id=openclaw-bookworm-apt-cache,target=/var/cache/apt,shar
         "$(dpkg --print-architecture)" > /etc/apt/sources.list.d/docker.list && \
       apt-get update && \
       DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-        docker-ce-cli docker-compose-plugin; \
+        docker-ce-cli docker-compose-plugin && \
+      apt-get clean && \
+      rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/*; \
     fi
+
+USER node
+COPY --chown=node:node . .
+# Normalize copied plugin/agent paths so plugin safety checks do not reject
+# world-writable directories inherited from source file modes.
+RUN for dir in /app/extensions /app/.agent /app/.agents; do \
+      if [ -d "$dir" ]; then \
+        find "$dir" -type d -exec chmod 755 {} +; \
+        find "$dir" -type f -exec chmod 644 {} +; \
+      fi; \
+    done
+RUN pnpm build
+
+# Force pnpm for UI build (Bun may fail on ARM/Synology architectures)
+ENV OPENCLAW_PREFER_PNPM=1
+RUN pnpm ui:build
 
 # Expose the CLI binary without requiring npm global writes as non-root.
 RUN ln -sf /app/openclaw.mjs /usr/local/bin/openclaw \
- && chmod 755 /app/openclaw.mjs
+    && chmod 755 /app/openclaw.mjs
+
+# Fix /tmp permissions for jiti cache (node user needs write access)
+RUN mkdir -p /tmp/jiti && chown -R node:node /tmp/jiti && chmod 1777 /tmp
 
 ENV NODE_ENV=production
 
