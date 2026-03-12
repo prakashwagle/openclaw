@@ -1,8 +1,8 @@
 # OpenClaw Fly.io deployment configuration
 # See https://fly.io/docs/reference/configuration/
 
-app = "openclaw"
-primary_region = "iad" # change to your closest region
+app = "moltbot-poki"
+primary_region = "sjc" # change to your closest region
 
 [build]
 dockerfile = "Dockerfile"
@@ -30,5 +30,5 @@ size = "shared-cpu-2x"
 memory = "2048mb"
 
 [mounts]
-source = "openclaw_data"
+source = "moltbot_data"
 destination = "/data"

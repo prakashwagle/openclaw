@@ -119,21 +119,7 @@ LABEL org.opencontainers.image.source="https://github.com/openclaw/openclaw" \
 RUN curl -fsSL https://bun.sh/install | bash
 ENV PATH="/root/.bun/bin:${PATH}"
 
-# Install Yarn
-RUN corepack enable && corepack prepare yarn@stable --activate
-
-# Install Homebrew dependencies
-RUN apt-get update && \
-    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-    build-essential procps curl file git sudo && \
-    apt-get clean && rm -rf /var/lib/apt/lists/*
-
-# Install Homebrew as node user (brew refuses to run as root)
-RUN echo "node ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers
-USER node
-RUN NONINTERACTIVE=1 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
-ENV PATH="/home/linuxbrew/.linuxbrew/bin:/home/linuxbrew/.linuxbrew/sbin:${PATH}"
-USER root
+RUN corepack enable
 
 WORKDIR /app
 
@@ -235,17 +221,13 @@ RUN for dir in /app/extensions /app/.agent /app/.agents; do \
       fi; \
     done
 RUN pnpm build
-
 # Force pnpm for UI build (Bun may fail on ARM/Synology architectures)
 ENV OPENCLAW_PREFER_PNPM=1
 RUN pnpm ui:build
 
 # Expose the CLI binary without requiring npm global writes as non-root.
 RUN ln -sf /app/openclaw.mjs /usr/local/bin/openclaw \
-    && chmod 755 /app/openclaw.mjs
-
-# Fix /tmp permissions for jiti cache (node user needs write access)
-RUN mkdir -p /tmp/jiti && chown -R node:node /tmp/jiti && chmod 1777 /tmp
+ && chmod 755 /app/openclaw.mjs
 
 ENV NODE_ENV=production
 
