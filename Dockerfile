@@ -228,6 +228,16 @@ RUN --mount=type=cache,id=openclaw-bookworm-apt-cache,target=/var/cache/apt,shar
       rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/*; \
     fi
 
+# Expose the CLI binary without requiring npm global writes as non-root.
+# Must run as root (before USER node) since /usr/local/bin is root-owned.
+RUN ln -sf /app/openclaw.mjs /usr/local/bin/openclaw \
+ && chmod 755 /app/openclaw.mjs
+
+ENV NODE_ENV=production
+
+# Security hardening: Run as non-root user
+# The node:22-bookworm image includes a 'node' user (uid 1000)
+# This reduces the attack surface by preventing container escape via root privileges
 USER node
 COPY --chown=node:node . .
 # Normalize copied plugin/agent paths so plugin safety checks do not reject
