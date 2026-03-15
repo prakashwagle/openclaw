@@ -249,21 +249,6 @@ RUN for dir in /app/extensions /app/.agent /app/.agents; do \
         find "$dir" -type f -exec chmod 644 {} +; \
       fi; \
     done
-RUN pnpm build
-# Force pnpm for UI build (Bun may fail on ARM/Synology architectures)
-ENV OPENCLAW_PREFER_PNPM=1
-RUN pnpm ui:build
-
-# Expose the CLI binary without requiring npm global writes as non-root.
-RUN ln -sf /app/openclaw.mjs /usr/local/bin/openclaw \
- && chmod 755 /app/openclaw.mjs
-
-ENV NODE_ENV=production
-
-# Security hardening: Run as non-root user
-# The node:24-bookworm image includes a 'node' user (uid 1000)
-# This reduces the attack surface by preventing container escape via root privileges
-USER node
 
 # Start gateway server with default config.
 # Binds to loopback (127.0.0.1) by default for security.
