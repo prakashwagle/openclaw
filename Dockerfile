@@ -140,7 +140,7 @@ RUN --mount=type=cache,id=openclaw-bookworm-apt-cache,target=/var/cache/apt,shar
     apt-get update && \
     DEBIAN_FRONTEND=noninteractive apt-get upgrade -y --no-install-recommends && \
     DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-      procps hostname curl git lsof openssl
+      procps hostname curl git lsof openssl gosu
 
 RUN chown node:node /app
 
@@ -233,16 +233,15 @@ RUN --mount=type=cache,id=openclaw-bookworm-apt-cache,target=/var/cache/apt,shar
       rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/*; \
     fi
 
-# Expose the CLI binary without requiring npm global writes as non-root.
-# Must run as root (before USER node) since /usr/local/bin is root-owned.
+# Expose the CLI binary and install the entrypoint script as root.
 RUN ln -sf /app/openclaw.mjs /usr/local/bin/openclaw \
  && chmod 755 /app/openclaw.mjs
+COPY --chmod=755 docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 
 ENV NODE_ENV=production
 
-# Security hardening: Run as non-root user
-# The node:22-bookworm image includes a 'node' user (uid 1000)
-# This reduces the attack surface by preventing container escape via root privileges
+# Copy runtime source (agents, skills overrides, etc.) and normalize permissions
+# as the node user so plugin safety checks pass.
 USER node
 COPY --chown=node:node . .
 # Normalize copied plugin/agent paths so plugin safety checks do not reject
@@ -253,6 +252,9 @@ RUN for dir in /app/extensions /app/.agent /app/.agents; do \
         find "$dir" -type f -exec chmod 644 {} +; \
       fi; \
     done
+
+# Switch back to root so the entrypoint can chown /data before dropping to node.
+USER root
 
 # Start gateway server with default config.
 # Binds to loopback (127.0.0.1) by default for security.
@@ -268,4 +270,5 @@ RUN for dir in /app/extensions /app/.agent /app/.agents; do \
 # For external access from host/ingress, override bind to "lan" and set auth.
 HEALTHCHECK --interval=3m --timeout=10s --start-period=15s --retries=3 \
   CMD node -e "fetch('http://127.0.0.1:18789/healthz').then((r)=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+ENTRYPOINT ["docker-entrypoint.sh"]
 CMD ["node", "openclaw.mjs", "gateway", "--allow-unconfigured"]
