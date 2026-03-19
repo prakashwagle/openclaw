@@ -1,7 +1,15 @@
 import fs from "node:fs";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
-import { removeFileIfExists, writeTextFileIfChanged } from "./runtime-postbuild-shared.mjs";
+import {
+  removeFileIfExists,
+  removePathIfExists,
+  writeTextFileIfChanged,
+} from "./runtime-postbuild-shared.mjs";
+
+const GENERATED_BUNDLED_SKILLS_DIR = "bundled-skills";
+const TRANSIENT_COPY_ERROR_CODES = new Set(["EEXIST", "ENOENT", "ENOTEMPTY", "EBUSY"]);
+const COPY_RETRY_DELAYS_MS = [10, 25, 50];
 
 export function rewritePackageExtensions(entries) {
   if (!Array.isArray(entries)) {
@@ -17,6 +25,15 @@ export function rewritePackageExtensions(entries) {
     });
 }
 
+function rewritePackageEntry(entry) {
+  if (typeof entry !== "string" || entry.trim().length === 0) {
+    return undefined;
+  }
+  const normalized = entry.replace(/^\.\//, "");
+  const rewritten = normalized.replace(/\.[^.]+$/u, ".js");
+  return `./${rewritten}`;
+}
+
 function ensurePathInsideRoot(rootDir, rawPath) {
   const resolved = path.resolve(rootDir, rawPath);
   const relative = path.relative(rootDir, resolved);
@@ -30,6 +47,76 @@ function ensurePathInsideRoot(rootDir, rawPath) {
   throw new Error(`path escapes plugin root: ${rawPath}`);
 }
 
+function normalizeManifestRelativePath(rawPath) {
+  return rawPath.replaceAll("\\", "/").replace(/^\.\//u, "");
+}
+
+function resolveDeclaredSkillSourcePath(params) {
+  const normalized = normalizeManifestRelativePath(params.rawPath);
+  const pluginLocalPath = ensurePathInsideRoot(params.pluginDir, normalized);
+  if (fs.existsSync(pluginLocalPath)) {
+    return pluginLocalPath;
+  }
+  if (!/^node_modules(?:\/|$)/u.test(normalized)) {
+    return pluginLocalPath;
+  }
+  return ensurePathInsideRoot(params.repoRoot, normalized);
+}
+
+function resolveBundledSkillTarget(rawPath) {
+  const normalized = normalizeManifestRelativePath(rawPath);
+  if (/^node_modules(?:\/|$)/u.test(normalized)) {
+    // Bundled dist/plugin roots must not publish nested node_modules trees. Relocate
+    // dependency-backed skill assets into a dist-owned directory and rewrite the manifest.
+    const trimmed = normalized.replace(/^node_modules\/?/u, "");
+    if (!trimmed) {
+      throw new Error(`node_modules skill path must point to a package: ${rawPath}`);
+    }
+    const bundledRelativePath = `${GENERATED_BUNDLED_SKILLS_DIR}/${trimmed}`;
+    return {
+      manifestPath: `./${bundledRelativePath}`,
+      outputPath: bundledRelativePath,
+    };
+  }
+  return {
+    manifestPath: rawPath,
+    outputPath: normalized,
+  };
+}
+
+function isTransientCopyError(error) {
+  return (
+    !!error &&
+    typeof error === "object" &&
+    typeof error.code === "string" &&
+    TRANSIENT_COPY_ERROR_CODES.has(error.code)
+  );
+}
+
+function sleepSync(ms) {
+  if (!Number.isFinite(ms) || ms <= 0) {
+    return;
+  }
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+function copySkillPathWithRetry(params) {
+  const maxAttempts = COPY_RETRY_DELAYS_MS.length + 1;
+  for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+    try {
+      removePathIfExists(params.targetPath);
+      fs.mkdirSync(path.dirname(params.targetPath), { recursive: true });
+      fs.cpSync(params.sourcePath, params.targetPath, params.copyOptions);
+      return;
+    } catch (error) {
+      if (!isTransientCopyError(error) || attempt === maxAttempts - 1) {
+        throw error;
+      }
+      sleepSync(COPY_RETRY_DELAYS_MS[attempt] ?? 0);
+    }
+  }
+}
+
 function copyDeclaredPluginSkillPaths(params) {
   const skills = Array.isArray(params.manifest.skills) ? params.manifest.skills : [];
   const copiedSkills = [];
@@ -37,8 +124,12 @@ function copyDeclaredPluginSkillPaths(params) {
     if (typeof raw !== "string" || raw.trim().length === 0) {
       continue;
     }
-    const normalized = raw.replace(/^\.\//u, "");
-    const sourcePath = ensurePathInsideRoot(params.pluginDir, raw);
+    const sourcePath = resolveDeclaredSkillSourcePath({
+      rawPath: raw,
+      pluginDir: params.pluginDir,
+      repoRoot: params.repoRoot,
+    });
+    const target = resolveBundledSkillTarget(raw);
     if (!fs.existsSync(sourcePath)) {
       // Some Docker/lightweight builds intentionally omit optional plugin-local
       // dependencies. Only advertise skill paths that were actually bundled.
@@ -47,14 +138,27 @@ function copyDeclaredPluginSkillPaths(params) {
       );
       continue;
     }
-    const targetPath = ensurePathInsideRoot(params.distPluginDir, normalized);
-    fs.mkdirSync(path.dirname(targetPath), { recursive: true });
-    fs.cpSync(sourcePath, targetPath, {
-      dereference: true,
-      force: true,
-      recursive: true,
+    const targetPath = ensurePathInsideRoot(params.distPluginDir, target.outputPath);
+    const shouldExcludeNestedNodeModules = /^node_modules(?:\/|$)/u.test(
+      normalizeManifestRelativePath(raw),
+    );
+    copySkillPathWithRetry({
+      sourcePath,
+      targetPath,
+      copyOptions: {
+        dereference: true,
+        force: true,
+        recursive: true,
+        filter: (candidatePath) => {
+          if (!shouldExcludeNestedNodeModules || candidatePath === sourcePath) {
+            return true;
+          }
+          const relativeCandidate = path.relative(sourcePath, candidatePath).replaceAll("\\", "/");
+          return !relativeCandidate.split("/").includes("node_modules");
+        },
+      },
     });
-    copiedSkills.push(raw);
+    copiedSkills.push(target.manifestPath);
   }
   return copiedSkills;
 }
@@ -68,7 +172,6 @@ export function copyBundledPluginMetadata(params = {}) {
   }
 
   const sourcePluginDirs = new Set();
-
   for (const dirent of fs.readdirSync(extensionsRoot, { withFileTypes: true })) {
     if (!dirent.isDirectory()) {
       continue;
@@ -81,13 +184,21 @@ export function copyBundledPluginMetadata(params = {}) {
     const distManifestPath = path.join(distPluginDir, "openclaw.plugin.json");
     const distPackageJsonPath = path.join(distPluginDir, "package.json");
     if (!fs.existsSync(manifestPath)) {
-      removeFileIfExists(distManifestPath);
-      removeFileIfExists(distPackageJsonPath);
+      removePathIfExists(distPluginDir);
       continue;
     }
 
     const manifest = JSON.parse(fs.readFileSync(manifestPath, "utf8"));
-    const copiedSkills = copyDeclaredPluginSkillPaths({ manifest, pluginDir, distPluginDir });
+    // Generated skill assets live under a dedicated dist-owned directory. Also
+    // remove the older bad node_modules tree so release packs cannot pick it up.
+    removePathIfExists(path.join(distPluginDir, GENERATED_BUNDLED_SKILLS_DIR));
+    removePathIfExists(path.join(distPluginDir, "node_modules"));
+    const copiedSkills = copyDeclaredPluginSkillPaths({
+      manifest,
+      pluginDir,
+      distPluginDir,
+      repoRoot,
+    });
     const bundledManifest = Array.isArray(manifest.skills)
       ? { ...manifest, skills: copiedSkills }
       : manifest;
@@ -104,6 +215,9 @@ export function copyBundledPluginMetadata(params = {}) {
       packageJson.openclaw = {
         ...packageJson.openclaw,
         extensions: rewritePackageExtensions(packageJson.openclaw.extensions),
+        ...(typeof packageJson.openclaw.setupEntry === "string"
+          ? { setupEntry: rewritePackageEntry(packageJson.openclaw.setupEntry) }
+          : {}),
       };
     }
 
@@ -119,8 +233,7 @@ export function copyBundledPluginMetadata(params = {}) {
       continue;
     }
     const distPluginDir = path.join(distExtensionsRoot, dirent.name);
-    removeFileIfExists(path.join(distPluginDir, "openclaw.plugin.json"));
-    removeFileIfExists(path.join(distPluginDir, "package.json"));
+    removePathIfExists(distPluginDir);
   }
 }
 
