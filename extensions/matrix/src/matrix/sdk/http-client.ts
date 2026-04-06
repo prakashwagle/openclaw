@@ -1,11 +1,27 @@
+import type { PinnedDispatcherPolicy } from "openclaw/plugin-sdk/infra-runtime";
+import type { SsrFPolicy } from "../../runtime-api.js";
 import { buildHttpError } from "./event-helpers.js";
 import { type HttpMethod, type QueryParams, performMatrixRequest } from "./transport.js";
 
+type MatrixAuthedHttpClientParams = {
+  homeserver: string;
+  accessToken: string;
+  ssrfPolicy?: SsrFPolicy;
+  dispatcherPolicy?: PinnedDispatcherPolicy;
+};
+
 export class MatrixAuthedHttpClient {
-  constructor(
-    private readonly homeserver: string,
-    private readonly accessToken: string,
-  ) {}
+  private readonly homeserver: string;
+  private readonly accessToken: string;
+  private readonly ssrfPolicy?: SsrFPolicy;
+  private readonly dispatcherPolicy?: PinnedDispatcherPolicy;
+
+  constructor(params: MatrixAuthedHttpClientParams) {
+    this.homeserver = params.homeserver;
+    this.accessToken = params.accessToken;
+    this.ssrfPolicy = params.ssrfPolicy;
+    this.dispatcherPolicy = params.dispatcherPolicy;
+  }
 
   async requestJson(params: {
     method: HttpMethod;
@@ -23,6 +39,8 @@ export class MatrixAuthedHttpClient {
       qs: params.qs,
       body: params.body,
       timeoutMs: params.timeoutMs,
+      ssrfPolicy: this.ssrfPolicy,
+      dispatcherPolicy: this.dispatcherPolicy,
       allowAbsoluteEndpoint: params.allowAbsoluteEndpoint,
     });
     if (!response.ok) {
@@ -57,6 +75,8 @@ export class MatrixAuthedHttpClient {
       raw: true,
       maxBytes: params.maxBytes,
       readIdleTimeoutMs: params.readIdleTimeoutMs,
+      ssrfPolicy: this.ssrfPolicy,
+      dispatcherPolicy: this.dispatcherPolicy,
       allowAbsoluteEndpoint: params.allowAbsoluteEndpoint,
     });
     if (!response.ok) {

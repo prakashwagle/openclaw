@@ -3,6 +3,7 @@ import {
   type ChannelSetupDmPolicy,
   type ChannelSetupWizardAdapter,
 } from "openclaw/plugin-sdk/setup";
+import { isPrivateNetworkOptInEnabled } from "openclaw/plugin-sdk/ssrf-runtime";
 import { requiresExplicitMatrixDefaultAccount } from "./account-selection.js";
 import { listMatrixDirectoryGroupsLive } from "./directory-live.js";
 import {
@@ -11,7 +12,11 @@ import {
   resolveMatrixAccount,
   resolveMatrixAccountConfig,
 } from "./matrix/accounts.js";
-import { resolveMatrixEnvAuthReadiness, validateMatrixHomeserverUrl } from "./matrix/client.js";
+import {
+  resolveValidatedMatrixHomeserverUrl,
+  validateMatrixHomeserverUrl,
+} from "./matrix/client.js";
+import { resolveMatrixEnvAuthReadiness } from "./matrix/client/env-auth.js";
 import {
   resolveMatrixConfigFieldPath,
   resolveMatrixConfigPath,
@@ -23,15 +28,16 @@ import type { DmPolicy } from "./runtime-api.js";
 import {
   addWildcardAllowFrom,
   formatDocsLink,
+  hasConfiguredSecretInput,
+  isPrivateOrLoopbackHost,
   mergeAllowFromEntries,
-  moveSingleAccountChannelSectionToDefaultAccount,
   normalizeAccountId,
   promptChannelAccessConfig,
   promptAccountId,
   type RuntimeEnv,
   type WizardPrompter,
 } from "./runtime-api.js";
-import { runMatrixSetupBootstrapAfterConfigWrite } from "./setup-bootstrap.js";
+import { moveSingleMatrixAccountConfigToNamedAccount } from "./setup-config.js";
 import type { CoreConfig } from "./types.js";
 
 const channel = "matrix" as const;
@@ -70,6 +76,15 @@ async function noteMatrixAuthHelp(prompter: WizardPrompter): Promise<void> {
     ].join("\n"),
     "Matrix setup",
   );
+}
+
+function requiresMatrixPrivateNetworkOptIn(homeserver: string): boolean {
+  try {
+    const parsed = new URL(homeserver);
+    return parsed.protocol === "http:" && !isPrivateOrLoopbackHost(parsed.hostname);
+  } catch {
+    return false;
+  }
 }
 
 async function promptMatrixAllowFrom(params: {
@@ -169,7 +184,7 @@ function setMatrixGroupPolicy(
 }
 
 function setMatrixGroupRooms(cfg: CoreConfig, roomKeys: string[], accountId?: string) {
-  const groups = Object.fromEntries(roomKeys.map((key) => [key, { allow: true }]));
+  const groups = Object.fromEntries(roomKeys.map((key) => [key, { enabled: true }]));
   return updateMatrixAccountConfig(cfg, resolveMatrixOnboardingAccountId(cfg, accountId), {
     groups,
     rooms: null,
@@ -235,10 +250,7 @@ async function runMatrixConfigure(params: {
       await params.prompter.note(`Account id will be "${accountId}".`, "Matrix account");
     }
     if (accountId !== DEFAULT_ACCOUNT_ID) {
-      next = moveSingleAccountChannelSectionToDefaultAccount({
-        cfg: next,
-        channelKey: channel,
-      }) as CoreConfig;
+      next = moveSingleMatrixAccountConfigToNamedAccount(next);
     }
     next = updateMatrixAccountConfig(next, accountId, { name: enteredName, enabled: true });
   } else {
@@ -298,7 +310,9 @@ async function runMatrixConfigure(params: {
       initialValue: existing.homeserver ?? envHomeserver,
       validate: (value) => {
         try {
-          validateMatrixHomeserverUrl(String(value ?? ""));
+          validateMatrixHomeserverUrl(String(value ?? ""), {
+            allowPrivateNetwork: true,
+          });
           return undefined;
         } catch (error) {
           return error instanceof Error ? error.message : "Invalid Matrix homeserver URL";
@@ -306,24 +320,39 @@ async function runMatrixConfigure(params: {
       },
     }),
   ).trim();
+  const requiresAllowPrivateNetwork = requiresMatrixPrivateNetworkOptIn(homeserver);
+  const shouldPromptAllowPrivateNetwork =
+    requiresAllowPrivateNetwork || isPrivateNetworkOptInEnabled(existing);
+  const allowPrivateNetwork = shouldPromptAllowPrivateNetwork
+    ? await params.prompter.confirm({
+        message: "Allow private/internal Matrix homeserver traffic for this account?",
+        initialValue: isPrivateNetworkOptInEnabled(existing) || requiresAllowPrivateNetwork,
+      })
+    : false;
+  if (requiresAllowPrivateNetwork && !allowPrivateNetwork) {
+    throw new Error("Matrix homeserver requires explicit private-network opt-in");
+  }
+  await resolveValidatedMatrixHomeserverUrl(homeserver, {
+    dangerouslyAllowPrivateNetwork: allowPrivateNetwork,
+  });
 
-  let accessToken = existing.accessToken ?? "";
-  let password = typeof existing.password === "string" ? existing.password : "";
+  let accessToken = existing.accessToken;
+  let password = existing.password;
   let userId = existing.userId ?? "";
 
-  if (accessToken || password) {
+  if (hasConfiguredSecretInput(accessToken) || hasConfiguredSecretInput(password)) {
     const keep = await params.prompter.confirm({
       message: "Matrix credentials already configured. Keep them?",
       initialValue: true,
     });
     if (!keep) {
-      accessToken = "";
-      password = "";
+      accessToken = undefined;
+      password = undefined;
       userId = "";
     }
   }
 
-  if (!accessToken && !password) {
+  if (!hasConfiguredSecretInput(accessToken) && !hasConfiguredSecretInput(password)) {
     const authMode = await params.prompter.select({
       message: "Matrix auth method",
       options: [
@@ -339,6 +368,7 @@ async function runMatrixConfigure(params: {
           validate: (value) => (value?.trim() ? undefined : "Required"),
         }),
       ).trim();
+      password = undefined;
       userId = "";
     } else {
       userId = String(
@@ -366,6 +396,7 @@ async function runMatrixConfigure(params: {
           validate: (value) => (value?.trim() ? undefined : "Required"),
         }),
       ).trim();
+      accessToken = undefined;
     }
   }
 
@@ -384,9 +415,12 @@ async function runMatrixConfigure(params: {
   next = updateMatrixAccountConfig(next, accountId, {
     enabled: true,
     homeserver,
+    ...(shouldPromptAllowPrivateNetwork
+      ? { allowPrivateNetwork: allowPrivateNetwork ? true : null }
+      : {}),
     userId: userId || null,
-    accessToken: accessToken || null,
-    password: password || null,
+    accessToken: accessToken ?? null,
+    password: password ?? null,
     deviceName: deviceName || null,
     encryption: enableEncryption,
   });
@@ -483,7 +517,7 @@ export const matrixOnboardingAdapter: ChannelSetupWizardAdapter = {
         channel,
         configured: false,
         statusLines: ['Matrix: set "channels.matrix.defaultAccount" to select a named account'],
-        selectionHint: !sdkReady ? "install matrix-js-sdk" : "set defaultAccount",
+        selectionHint: !sdkReady ? "install Matrix deps" : "set defaultAccount",
       };
     }
     const account = resolveMatrixAccount({
@@ -497,7 +531,7 @@ export const matrixOnboardingAdapter: ChannelSetupWizardAdapter = {
       statusLines: [
         `Matrix: ${configured ? "configured" : "needs homeserver + access token or password"}`,
       ],
-      selectionHint: !sdkReady ? "install matrix-js-sdk" : configured ? "configured" : "needs auth",
+      selectionHint: !sdkReady ? "install Matrix deps" : configured ? "configured" : "needs auth",
     };
   },
   configure: async ({
@@ -560,6 +594,7 @@ export const matrixOnboardingAdapter: ChannelSetupWizardAdapter = {
     });
   },
   afterConfigWritten: async ({ previousCfg, cfg, accountId, runtime }) => {
+    const { runMatrixSetupBootstrapAfterConfigWrite } = await import("./setup-bootstrap.js");
     await runMatrixSetupBootstrapAfterConfigWrite({
       previousCfg: previousCfg as CoreConfig,
       cfg: cfg as CoreConfig,

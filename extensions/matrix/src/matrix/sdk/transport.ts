@@ -1,3 +1,15 @@
+import {
+  fetchWithRuntimeDispatcher,
+  type PinnedDispatcherPolicy,
+} from "openclaw/plugin-sdk/infra-runtime";
+import {
+  buildTimeoutAbortSignal,
+  closeDispatcher,
+  createPinnedDispatcher,
+  resolvePinnedHostnameWithPolicy,
+  type SsrFPolicy,
+} from "../../runtime-api.js";
+import { MatrixMediaSizeLimitError } from "../media-errors.js";
 import { readResponseWithLimit } from "./read-response-with-limit.js";
 
 export type HttpMethod = "GET" | "POST" | "PUT" | "DELETE";
@@ -11,6 +23,10 @@ type QueryValue =
   | Array<string | number | boolean | null | undefined>;
 
 export type QueryParams = Record<string, QueryValue> | null | undefined;
+
+type MatrixDispatcherRequestInit = RequestInit & {
+  dispatcher?: ReturnType<typeof createPinnedDispatcher>;
+};
 
 function normalizeEndpoint(endpoint: string): string {
   if (!endpoint) {
@@ -44,60 +60,190 @@ function isRedirectStatus(statusCode: number): boolean {
   return statusCode >= 300 && statusCode < 400;
 }
 
-async function fetchWithSafeRedirects(url: URL, init: RequestInit): Promise<Response> {
-  let currentUrl = new URL(url.toString());
-  let method = (init.method ?? "GET").toUpperCase();
-  let body = init.body;
-  let headers = new Headers(init.headers ?? {});
+function toFetchUrl(resource: RequestInfo | URL): string {
+  if (resource instanceof URL) {
+    return resource.toString();
+  }
+  if (typeof resource === "string") {
+    return resource;
+  }
+  return resource.url;
+}
+
+function buildBufferedResponse(params: {
+  source: Response;
+  body: ArrayBuffer;
+  url: string;
+}): Response {
+  const response = new Response(params.body, {
+    status: params.source.status,
+    statusText: params.source.statusText,
+    headers: new Headers(params.source.headers),
+  });
+  try {
+    Object.defineProperty(response, "url", {
+      value: params.source.url || params.url,
+      configurable: true,
+    });
+  } catch {
+    // Response.url is read-only in some runtimes; metadata is best-effort only.
+  }
+  return response;
+}
+
+function isMockedFetch(fetchImpl: typeof fetch | undefined): boolean {
+  if (typeof fetchImpl !== "function") {
+    return false;
+  }
+  return typeof (fetchImpl as typeof fetch & { mock?: unknown }).mock === "object";
+}
+
+async function fetchWithMatrixDispatcher(params: {
+  url: string;
+  init: MatrixDispatcherRequestInit;
+}): Promise<Response> {
+  // Keep this dispatcher-routing logic local to Matrix transport. Shared SSRF
+  // fetches must stay fail-closed unless a retry path can preserve the
+  // validated pinned-address binding. Route dispatcher-attached requests
+  // through undici runtime fetch so the pinned dispatcher is preserved.
+  if (params.init.dispatcher && !isMockedFetch(globalThis.fetch)) {
+    return await fetchWithRuntimeDispatcher(params.url, params.init);
+  }
+  return await fetch(params.url, params.init);
+}
+
+async function fetchWithMatrixGuardedRedirects(params: {
+  url: string;
+  init?: RequestInit;
+  signal?: AbortSignal;
+  timeoutMs?: number;
+  ssrfPolicy?: SsrFPolicy;
+  dispatcherPolicy?: PinnedDispatcherPolicy;
+}): Promise<{ response: Response; release: () => Promise<void>; finalUrl: string }> {
+  let currentUrl = new URL(params.url);
+  let method = (params.init?.method ?? "GET").toUpperCase();
+  let body = params.init?.body;
+  let headers = new Headers(params.init?.headers ?? {});
   const maxRedirects = 5;
+  const visited = new Set<string>();
+  const { signal, cleanup } = buildTimeoutAbortSignal({
+    timeoutMs: params.timeoutMs,
+    signal: params.signal,
+  });
 
   for (let redirectCount = 0; redirectCount <= maxRedirects; redirectCount += 1) {
-    const response = await fetch(currentUrl, {
-      ...init,
-      method,
-      body,
-      headers,
-      redirect: "manual",
-    });
+    let dispatcher: ReturnType<typeof createPinnedDispatcher> | undefined;
+    try {
+      const pinned = await resolvePinnedHostnameWithPolicy(currentUrl.hostname, {
+        policy: params.ssrfPolicy,
+      });
+      dispatcher = createPinnedDispatcher(pinned, params.dispatcherPolicy, params.ssrfPolicy);
+      const response = await fetchWithMatrixDispatcher({
+        url: currentUrl.toString(),
+        init: {
+          ...params.init,
+          method,
+          body,
+          headers,
+          redirect: "manual",
+          signal,
+          dispatcher,
+        } as MatrixDispatcherRequestInit,
+      });
 
-    if (!isRedirectStatus(response.status)) {
-      return response;
+      if (!isRedirectStatus(response.status)) {
+        return {
+          response,
+          release: async () => {
+            cleanup();
+            await closeDispatcher(dispatcher);
+          },
+          finalUrl: currentUrl.toString(),
+        };
+      }
+
+      const location = response.headers.get("location");
+      if (!location) {
+        cleanup();
+        await closeDispatcher(dispatcher);
+        throw new Error(`Matrix redirect missing location header (${currentUrl.toString()})`);
+      }
+
+      const nextUrl = new URL(location, currentUrl);
+      if (nextUrl.protocol !== currentUrl.protocol) {
+        cleanup();
+        await closeDispatcher(dispatcher);
+        throw new Error(
+          `Blocked cross-protocol redirect (${currentUrl.protocol} -> ${nextUrl.protocol})`,
+        );
+      }
+
+      const nextUrlString = nextUrl.toString();
+      if (visited.has(nextUrlString)) {
+        cleanup();
+        await closeDispatcher(dispatcher);
+        throw new Error("Redirect loop detected");
+      }
+      visited.add(nextUrlString);
+
+      if (nextUrl.origin !== currentUrl.origin) {
+        headers = new Headers(headers);
+        headers.delete("authorization");
+      }
+
+      if (
+        response.status === 303 ||
+        ((response.status === 301 || response.status === 302) &&
+          method !== "GET" &&
+          method !== "HEAD")
+      ) {
+        method = "GET";
+        body = undefined;
+        headers = new Headers(headers);
+        headers.delete("content-type");
+        headers.delete("content-length");
+      }
+
+      void response.body?.cancel();
+      await closeDispatcher(dispatcher);
+      currentUrl = nextUrl;
+    } catch (error) {
+      cleanup();
+      await closeDispatcher(dispatcher);
+      throw error;
     }
-
-    const location = response.headers.get("location");
-    if (!location) {
-      throw new Error(`Matrix redirect missing location header (${currentUrl.toString()})`);
-    }
-
-    const nextUrl = new URL(location, currentUrl);
-    if (nextUrl.protocol !== currentUrl.protocol) {
-      throw new Error(
-        `Blocked cross-protocol redirect (${currentUrl.protocol} -> ${nextUrl.protocol})`,
-      );
-    }
-
-    if (nextUrl.origin !== currentUrl.origin) {
-      headers = new Headers(headers);
-      headers.delete("authorization");
-    }
-
-    if (
-      response.status === 303 ||
-      ((response.status === 301 || response.status === 302) &&
-        method !== "GET" &&
-        method !== "HEAD")
-    ) {
-      method = "GET";
-      body = undefined;
-      headers = new Headers(headers);
-      headers.delete("content-type");
-      headers.delete("content-length");
-    }
-
-    currentUrl = nextUrl;
   }
 
-  throw new Error(`Too many redirects while requesting ${url.toString()}`);
+  cleanup();
+  throw new Error(`Too many redirects while requesting ${params.url}`);
+}
+
+export function createMatrixGuardedFetch(params: {
+  ssrfPolicy?: SsrFPolicy;
+  dispatcherPolicy?: PinnedDispatcherPolicy;
+}): typeof fetch {
+  return (async (resource: RequestInfo | URL, init?: RequestInit) => {
+    const url = toFetchUrl(resource);
+    const { signal, ...requestInit } = init ?? {};
+    const { response, release } = await fetchWithMatrixGuardedRedirects({
+      url,
+      init: requestInit,
+      signal: signal ?? undefined,
+      ssrfPolicy: params.ssrfPolicy,
+      dispatcherPolicy: params.dispatcherPolicy,
+    });
+
+    try {
+      const body = await response.arrayBuffer();
+      return buildBufferedResponse({
+        source: response,
+        body,
+        url,
+      });
+    } finally {
+      await release();
+    }
+  }) as typeof fetch;
 }
 
 export async function performMatrixRequest(params: {
@@ -111,6 +257,8 @@ export async function performMatrixRequest(params: {
   raw?: boolean;
   maxBytes?: number;
   readIdleTimeoutMs?: number;
+  ssrfPolicy?: SsrFPolicy;
+  dispatcherPolicy?: PinnedDispatcherPolicy;
   allowAbsoluteEndpoint?: boolean;
 }): Promise<{ response: Response; text: string; buffer: Buffer }> {
   const isAbsoluteEndpoint =
@@ -146,21 +294,25 @@ export async function performMatrixRequest(params: {
     }
   }
 
-  const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), params.timeoutMs);
-  try {
-    const response = await fetchWithSafeRedirects(baseUrl, {
+  const { response, release } = await fetchWithMatrixGuardedRedirects({
+    url: baseUrl.toString(),
+    init: {
       method: params.method,
       headers,
       body,
-      signal: controller.signal,
-    });
+    },
+    timeoutMs: params.timeoutMs,
+    ssrfPolicy: params.ssrfPolicy,
+    dispatcherPolicy: params.dispatcherPolicy,
+  });
+
+  try {
     if (params.raw) {
       const contentLength = response.headers.get("content-length");
       if (params.maxBytes && contentLength) {
         const length = Number(contentLength);
         if (Number.isFinite(length) && length > params.maxBytes) {
-          throw new Error(
+          throw new MatrixMediaSizeLimitError(
             `Matrix media exceeds configured size limit (${length} bytes > ${params.maxBytes} bytes)`,
           );
         }
@@ -168,7 +320,7 @@ export async function performMatrixRequest(params: {
       const bytes = params.maxBytes
         ? await readResponseWithLimit(response, params.maxBytes, {
             onOverflow: ({ maxBytes, size }) =>
-              new Error(
+              new MatrixMediaSizeLimitError(
                 `Matrix media exceeds configured size limit (${size} bytes > ${maxBytes} bytes)`,
               ),
             chunkTimeoutMs: params.readIdleTimeoutMs,
@@ -187,6 +339,6 @@ export async function performMatrixRequest(params: {
       buffer: Buffer.from(text, "utf8"),
     };
   } finally {
-    clearTimeout(timeoutId);
+    await release();
   }
 }

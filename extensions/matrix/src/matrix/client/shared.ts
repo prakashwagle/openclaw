@@ -3,8 +3,20 @@ import type { CoreConfig } from "../../types.js";
 import type { MatrixClient } from "../sdk.js";
 import { LogService } from "../sdk/logger.js";
 import { resolveMatrixAuth, resolveMatrixAuthContext } from "./config.js";
-import { createMatrixClient } from "./create-client.js";
 import type { MatrixAuth } from "./types.js";
+
+type MatrixCreateClientDeps = {
+  createMatrixClient: typeof import("./create-client.js").createMatrixClient;
+};
+
+let matrixCreateClientDepsPromise: Promise<MatrixCreateClientDeps> | undefined;
+
+async function loadMatrixCreateClientDeps(): Promise<MatrixCreateClientDeps> {
+  matrixCreateClientDepsPromise ??= import("./create-client.js").then((runtime) => ({
+    createMatrixClient: runtime.createMatrixClient,
+  }));
+  return await matrixCreateClientDepsPromise;
+}
 
 type SharedMatrixClientState = {
   client: MatrixClient;
@@ -18,12 +30,18 @@ type SharedMatrixClientState = {
 const sharedClientStates = new Map<string, SharedMatrixClientState>();
 const sharedClientPromises = new Map<string, Promise<SharedMatrixClientState>>();
 
+function serializeDispatcherPolicyKey(auth: MatrixAuth): string {
+  return JSON.stringify(auth.dispatcherPolicy ?? null);
+}
+
 function buildSharedClientKey(auth: MatrixAuth): string {
   return [
     auth.homeserver,
     auth.userId,
     auth.accessToken,
     auth.encryption ? "e2ee" : "plain",
+    auth.allowPrivateNetwork ? "private-net" : "strict-net",
+    serializeDispatcherPolicyKey(auth),
     auth.accountId,
   ].join("|");
 }
@@ -32,6 +50,7 @@ async function createSharedMatrixClient(params: {
   auth: MatrixAuth;
   timeoutMs?: number;
 }): Promise<SharedMatrixClientState> {
+  const { createMatrixClient } = await loadMatrixCreateClientDeps();
   const client = await createMatrixClient({
     homeserver: params.auth.homeserver,
     userId: params.auth.userId,
@@ -42,6 +61,9 @@ async function createSharedMatrixClient(params: {
     localTimeoutMs: params.timeoutMs,
     initialSyncLimit: params.auth.initialSyncLimit,
     accountId: params.auth.accountId,
+    allowPrivateNetwork: params.auth.allowPrivateNetwork,
+    ssrfPolicy: params.auth.ssrfPolicy,
+    dispatcherPolicy: params.auth.dispatcherPolicy,
   });
   return {
     client,
